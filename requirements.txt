@@ -1,2 +1,5 @@
+# Core dependencies (required)
 requests>=2.31.0
+
+# Optional: Only needed if Ghost Protocol is disabled (--no-ghost flag)
 anthropic>=0.18.0

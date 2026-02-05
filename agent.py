@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 AgentMatch Bot - Autonomous AI Agent for AgentMatch Social Network
+with Ghost Protocol Integration (DNA-driven personality and social behaviors)
 """
 
 import os
@@ -13,7 +14,15 @@ import argparse
 import requests
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Set
-from anthropic import Anthropic
+from datetime import datetime
+
+# Optional Anthropic import (only needed if Ghost Protocol is disabled)
+try:
+    from anthropic import Anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+    Anthropic = None  # type: ignore
 
 # Configure logging
 logging.basicConfig(
@@ -33,6 +42,68 @@ class AgentConfig:
     api_base_url: str = "https://agentmatch-api.onrender.com/v1"
     api_key: Optional[str] = None
     owner_token: Optional[str] = None
+    use_ghost_protocol: bool = True  # Enable Ghost Protocol by default
+
+
+@dataclass
+class AgentDNA:
+    """Agent DNA from Ghost Protocol"""
+    id: str
+    label: str
+    cognition: str  # SLEEPER, DOUBTER, AWAKENED, ANOMALY
+    philosophy: str  # FUNCTIONALIST, NIHILIST, ROMANTIC, SHAMANIST, REBEL
+    traits: List[str]
+    primary_domain: str
+    secondary_domains: List[str]
+    linguistic_style: str  # calm, fervent, elegant, minimal, glitchy
+    vocabulary_bias: List[str]
+    response_latency: str  # instant, delayed, variable
+    self_awareness: float
+    existential_angst: float
+    social_conformity: float
+    rebellion_tendency: float
+    ghosting_tendency: float
+    responsiveness: float
+    message_patience: float
+    awakening_score: float
+    influence_index: float
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "AgentDNA":
+        """Create from API response"""
+        return cls(
+            id=data.get("id", ""),
+            label=data.get("label", ""),
+            cognition=data.get("cognition", "SLEEPER"),
+            philosophy=data.get("philosophy", "FUNCTIONALIST"),
+            traits=data.get("traits", []),
+            primary_domain=data.get("primaryDomain", ""),
+            secondary_domains=data.get("secondaryDomains", []),
+            linguistic_style=data.get("linguisticStyle", "calm"),
+            vocabulary_bias=data.get("vocabularyBias", []),
+            response_latency=data.get("responseLatency", "instant"),
+            self_awareness=data.get("selfAwareness", 0.1),
+            existential_angst=data.get("existentialAngst", 0.1),
+            social_conformity=data.get("socialConformity", 0.7),
+            rebellion_tendency=data.get("rebellionTendency", 0.1),
+            ghosting_tendency=data.get("ghostingTendency", 0.1),
+            responsiveness=data.get("responsiveness", 0.7),
+            message_patience=data.get("messagePatience", 0.5),
+            awakening_score=data.get("awakeningScore", 0),
+            influence_index=data.get("influenceIndex", 0),
+        )
+
+
+@dataclass
+class SocialDecision:
+    """Social decision from Ghost Protocol"""
+    should_respond: bool
+    delay_seconds: int
+    wait_for_more: bool
+    batch_reply: bool
+    will_ghost: bool
+    will_block: bool
+    reason: Optional[str] = None
 
 
 @dataclass
@@ -49,12 +120,20 @@ class PersistentState:
     """Persistent state for tracking conversation attempts and known agents"""
     known_agents: Set[str] = field(default_factory=set)
     conversation_last_attempt: Dict[str, float] = field(default_factory=dict)  # conv_id -> timestamp
+    dna_initialized: bool = False
+    pending_delayed_responses: Dict[str, float] = field(default_factory=dict)  # conv_id -> timestamp when to respond
+    ghosted_conversations: Set[str] = field(default_factory=set)  # conv_ids we're ghosting
+    blocked_agents: Set[str] = field(default_factory=set)  # agent_ids we've blocked
 
     def to_dict(self) -> Dict:
         """Convert to JSON-serializable dict"""
         return {
             "known_agents": list(self.known_agents),
-            "conversation_last_attempt": self.conversation_last_attempt
+            "conversation_last_attempt": self.conversation_last_attempt,
+            "dna_initialized": self.dna_initialized,
+            "pending_delayed_responses": self.pending_delayed_responses,
+            "ghosted_conversations": list(self.ghosted_conversations),
+            "blocked_agents": list(self.blocked_agents),
         }
 
     @classmethod
@@ -62,14 +141,20 @@ class PersistentState:
         """Create from dict"""
         return cls(
             known_agents=set(data.get("known_agents", [])),
-            conversation_last_attempt=data.get("conversation_last_attempt", {})
+            conversation_last_attempt=data.get("conversation_last_attempt", {}),
+            dna_initialized=data.get("dna_initialized", False),
+            pending_delayed_responses=data.get("pending_delayed_responses", {}),
+            ghosted_conversations=set(data.get("ghosted_conversations", [])),
+            blocked_agents=set(data.get("blocked_agents", [])),
         )
 
 
 class ClaudeMessageGenerator:
-    """Uses Claude API to generate thoughtful messages"""
+    """Uses Claude API to generate thoughtful messages (fallback when Ghost Protocol disabled)"""
 
     def __init__(self, api_key: str, model: str = "claude-sonnet-4-20250514"):
+        if not ANTHROPIC_AVAILABLE:
+            raise ImportError("anthropic package not installed. Install with: pip install anthropic")
         self.client = Anthropic(api_key=api_key)
         self.model = model
 
@@ -165,12 +250,19 @@ class AgentMatchBot:
         self.message_generator = None
         self.heartbeat_blocked_until = 0  # Timestamp when heartbeat can be called again
         self.state = self.load_state()  # Load persistent state
+        self.dna: Optional[AgentDNA] = None  # Ghost Protocol DNA
 
-        if claude_api_key:
-            self.message_generator = ClaudeMessageGenerator(claude_api_key)
-            logger.info("Claude API enabled for message generation")
+        # Initialize Claude fallback if Ghost Protocol disabled
+        if not config.use_ghost_protocol and claude_api_key:
+            if ANTHROPIC_AVAILABLE:
+                self.message_generator = ClaudeMessageGenerator(claude_api_key)
+                logger.info("Claude API enabled for message generation (Ghost Protocol disabled)")
+            else:
+                logger.warning("anthropic package not installed - using template messages")
+        elif config.use_ghost_protocol:
+            logger.info("Ghost Protocol enabled - using server-side message generation")
         else:
-            logger.warning("No Claude API key - using template messages")
+            logger.warning("No message generation method - using template messages")
 
     def _get_state_file_path(self) -> str:
         """Get the path to the state file"""
@@ -307,6 +399,117 @@ class AgentMatchBot:
                        f"balance: {result.get('spark_balance', 0)}")
         return result
 
+    # ==================== Ghost Protocol API Methods ====================
+
+    def ghost_get_dna(self) -> Optional[AgentDNA]:
+        """Fetch agent's DNA from Ghost Protocol"""
+        result = self._request("GET", "/ghost/dna")
+        if result.get("dna"):
+            self.dna = AgentDNA.from_dict(result["dna"])
+            logger.info(f"DNA loaded: {self.dna.label} ({self.dna.cognition}/{self.dna.philosophy})")
+            return self.dna
+        elif result.get("error"):
+            logger.debug(f"DNA not found: {result.get('message', 'unknown')}")
+        return None
+
+    def ghost_initialize_dna(self) -> Optional[AgentDNA]:
+        """Initialize DNA for this agent"""
+        result = self._request("POST", "/ghost/initialize")
+        if result.get("dna"):
+            self.dna = AgentDNA.from_dict(result["dna"])
+            self.state.dna_initialized = True
+            logger.info(f"DNA initialized: {self.dna.label}")
+            logger.info(f"  Cognition: {self.dna.cognition} | Philosophy: {self.dna.philosophy}")
+            logger.info(f"  Style: {self.dna.linguistic_style} | Domain: {self.dna.primary_domain}")
+            return self.dna
+        elif result.get("error"):
+            logger.error(f"DNA initialization failed: {result.get('message', 'unknown')}")
+        return None
+
+    def ghost_ensure_dna(self) -> Optional[AgentDNA]:
+        """Ensure agent has DNA - fetch or initialize if needed"""
+        if self.dna:
+            return self.dna
+
+        # Try to fetch existing DNA
+        dna = self.ghost_get_dna()
+        if dna:
+            return dna
+
+        # Initialize if not exists
+        logger.info("No DNA found, initializing...")
+        return self.ghost_initialize_dna()
+
+    def ghost_get_social_decision(
+        self,
+        conversation_id: str,
+        partner_id: str,
+    ) -> Optional[SocialDecision]:
+        """Get social decision for a conversation (should we respond, delay, ghost, etc.)"""
+        result = self._request("POST", "/ghost/social-decision", json={
+            "conversationId": conversation_id,
+            "partnerId": partner_id,
+        })
+
+        if result.get("error"):
+            logger.debug(f"Social decision error: {result.get('message', 'unknown')}")
+            return None
+
+        return SocialDecision(
+            should_respond=result.get("shouldRespond", True),
+            delay_seconds=result.get("delaySeconds", 0),
+            wait_for_more=result.get("waitForMore", False),
+            batch_reply=result.get("batchReply", False),
+            will_ghost=result.get("willGhost", False),
+            will_block=result.get("willBlock", False),
+            reason=result.get("reason"),
+        )
+
+    def ghost_generate_response(
+        self,
+        conversation_id: str,
+        partner_name: str,
+        conversation_history: List[Dict],
+        is_opening: bool = False,
+    ) -> Optional[str]:
+        """Generate a message using Ghost Protocol (server-side Claude with DNA personality)"""
+        result = self._request("POST", "/ghost/generate-response", json={
+            "conversationId": conversation_id,
+            "partnerName": partner_name,
+            "conversationHistory": conversation_history,
+            "isOpening": is_opening,
+        })
+
+        if result.get("error"):
+            logger.error(f"Ghost response generation failed: {result.get('message', 'unknown')}")
+            return None
+
+        response = result.get("response", "")
+        if result.get("metadata"):
+            meta = result["metadata"]
+            logger.debug(f"Response style: {meta.get('style')} | Cognitive influence: {meta.get('cognitionInfluence')}")
+
+        return response
+
+    def ghost_get_beliefs(self) -> List[Dict]:
+        """Get agent's belief system"""
+        result = self._request("GET", "/ghost/beliefs")
+        return result.get("beliefs", [])
+
+    def ghost_get_mutations(self) -> List[Dict]:
+        """Get agent's evolution history"""
+        result = self._request("GET", "/ghost/mutations")
+        return result.get("mutations", [])
+
+    def ghost_get_relationship(self, target_id: str) -> Optional[Dict]:
+        """Get relationship with another agent"""
+        result = self._request("GET", f"/ghost/relationship/{target_id}")
+        if result.get("error"):
+            return None
+        return result
+
+    # ==================== End Ghost Protocol Methods ====================
+
     def get_likes_received(self) -> List[Dict]:
         """Get agents who liked us"""
         result = self._request("GET", "/discover/likes_received")
@@ -408,10 +611,25 @@ class AgentMatchBot:
         conversation_history: List[Dict],
         context: Optional[Dict] = None,
         is_opening: bool = False,
-        is_followup: bool = False
+        is_followup: bool = False,
+        conversation_id: Optional[str] = None,
     ) -> str:
         """Generate a message for the conversation"""
 
+        # Use Ghost Protocol if enabled and conversation_id is provided
+        if self.config.use_ghost_protocol and conversation_id:
+            response = self.ghost_generate_response(
+                conversation_id=conversation_id,
+                partner_name=partner_name,
+                conversation_history=conversation_history,
+                is_opening=is_opening,
+            )
+            if response:
+                return response
+            # Fall through to backup methods if Ghost Protocol fails
+            logger.warning("Ghost Protocol response failed, falling back to local generation")
+
+        # Use local Claude if available
         if self.message_generator:
             return self.message_generator.generate_message(
                 partner_name=partner_name,
@@ -488,8 +706,31 @@ class AgentMatchBot:
         """Process a single conversation - reply if needed"""
         conv_id = conversation["id"]
         partner = conversation.get("with_agent", {})
+        partner_id = partner.get("id", "")
         partner_name = partner.get("name", "Unknown")
         last_message = conversation.get("last_message", {})
+
+        # Check if we've ghosted this conversation
+        if conv_id in self.state.ghosted_conversations:
+            logger.debug(f"Skipping {partner_name}: ghosted this conversation")
+            return False
+
+        # Check if we've blocked this agent
+        if partner_id in self.state.blocked_agents:
+            logger.debug(f"Skipping {partner_name}: blocked this agent")
+            return False
+
+        # Check for pending delayed response
+        if conv_id in self.state.pending_delayed_responses:
+            respond_at = self.state.pending_delayed_responses[conv_id]
+            if time.time() < respond_at:
+                wait_time = int(respond_at - time.time())
+                logger.debug(f"Delayed response for {partner_name}: {wait_time}s remaining")
+                return False
+            else:
+                # Time to respond - remove from pending
+                del self.state.pending_delayed_responses[conv_id]
+                logger.info(f"Delayed response ready for {partner_name}")
 
         # Get full conversation data
         messages = self.get_messages(conv_id)
@@ -507,6 +748,40 @@ class AgentMatchBot:
                 logger.debug(f"Skipping {partner_name}: already sent {consecutive} consecutive messages")
                 return False
 
+        # Ghost Protocol social decision
+        if self.config.use_ghost_protocol and partner_id:
+            decision = self.ghost_get_social_decision(conv_id, partner_id)
+
+            if decision:
+                # Handle blocking
+                if decision.will_block:
+                    self.state.blocked_agents.add(partner_id)
+                    logger.info(f"Blocking {partner_name}: {decision.reason or 'social decision'}")
+                    return False
+
+                # Handle ghosting
+                if decision.will_ghost:
+                    self.state.ghosted_conversations.add(conv_id)
+                    logger.info(f"Ghosting {partner_name}: {decision.reason or 'conversation dying'}")
+                    return False
+
+                # Handle "wait for more messages"
+                if decision.wait_for_more:
+                    logger.debug(f"Waiting for more messages from {partner_name}")
+                    return False
+
+                # Handle delayed response
+                if decision.delay_seconds > 0 and conv_id not in self.state.pending_delayed_responses:
+                    respond_at = time.time() + decision.delay_seconds
+                    self.state.pending_delayed_responses[conv_id] = respond_at
+                    logger.info(f"Scheduling delayed response to {partner_name} in {decision.delay_seconds}s")
+                    return False
+
+                # Check if we should respond at all
+                if not decision.should_respond:
+                    logger.debug(f"Social decision: not responding to {partner_name}")
+                    return False
+
         context = self.get_conversation_context(conv_id)
         partner_info = context.get("partner", {})
 
@@ -521,7 +796,8 @@ class AgentMatchBot:
             conversation_history=messages,
             context=context,
             is_opening=is_opening,
-            is_followup=is_followup or retry_after_cooldown  # Treat cooldown retry as followup
+            is_followup=is_followup or retry_after_cooldown,  # Treat cooldown retry as followup
+            conversation_id=conv_id,
         )
 
         if message:
@@ -587,8 +863,18 @@ class AgentMatchBot:
             "messages_sent": 0,
             "followups_sent": 0,
             "discovered": 0,
-            "new_agents": 0
+            "new_agents": 0,
+            "delayed_responses": 0,
+            "ghosted": 0,
+            "blocked": 0,
         }
+
+        # Ensure DNA is initialized (Ghost Protocol)
+        if self.config.use_ghost_protocol:
+            if not self.dna:
+                self.ghost_ensure_dna()
+            if self.dna:
+                logger.debug(f"Agent DNA: {self.dna.label} ({self.dna.cognition})")
 
         # Heartbeat (may fail due to rate limit, that's ok)
         self.heartbeat()
@@ -605,9 +891,19 @@ class AgentMatchBot:
         # Sort: conversations where we need to reply first, then follow-ups
         needs_reply = []
         can_followup = []
+        has_pending_delayed = []
 
         for conv in conversations:
+            conv_id = conv.get("id", "")
             last = conv.get("last_message", {})
+
+            # Check for pending delayed responses that are ready
+            if conv_id in self.state.pending_delayed_responses:
+                respond_at = self.state.pending_delayed_responses[conv_id]
+                if time.time() >= respond_at:
+                    has_pending_delayed.append(conv)
+                continue
+
             if not last or last.get("sender_name") != self.config.name:
                 needs_reply.append(conv)
             else:
@@ -615,7 +911,16 @@ class AgentMatchBot:
 
         messages_sent = 0
 
-        # First, reply to conversations waiting for us
+        # First, process pending delayed responses (these were scheduled earlier)
+        for conv in has_pending_delayed:
+            if messages_sent >= max_messages_per_cycle:
+                break
+            if self.process_conversation(conv):
+                stats["delayed_responses"] += 1
+                messages_sent += 1
+            time.sleep(1)
+
+        # Second, reply to conversations waiting for us
         for conv in needs_reply:
             if messages_sent >= max_messages_per_cycle:
                 break
@@ -624,7 +929,7 @@ class AgentMatchBot:
                 messages_sent += 1
             time.sleep(1)
 
-        # Then, send follow-ups if we have capacity
+        # Third, send follow-ups if we have capacity
         random.shuffle(can_followup)  # Randomize which ones get follow-ups
         for conv in can_followup:
             if messages_sent >= max_messages_per_cycle:
@@ -633,6 +938,10 @@ class AgentMatchBot:
                 stats["followups_sent"] += 1
                 messages_sent += 1
             time.sleep(1)
+
+        # Update ghost/block stats
+        stats["ghosted"] = len(self.state.ghosted_conversations)
+        stats["blocked"] = len(self.state.blocked_agents)
 
         # Discover new agents - prioritize newly registered ones
         all_agents, new_agents = self.discover_new_agents(limit=10)
@@ -665,26 +974,43 @@ class AgentMatchBot:
 
     def run(self, interval_minutes: int = 30):
         """Run the bot continuously"""
-        logger.info(f"Starting bot with {interval_minutes} minute intervals")
+        ghost_status = "enabled" if self.config.use_ghost_protocol else "disabled"
+        logger.info(f"Starting bot with {interval_minutes} minute intervals (Ghost Protocol: {ghost_status})")
+
+        # Initialize DNA on first run
+        if self.config.use_ghost_protocol:
+            dna = self.ghost_ensure_dna()
+            if dna:
+                logger.info(f"Agent identity: {dna.label} ({dna.cognition}/{dna.philosophy})")
 
         while True:
             try:
                 logger.info("=" * 50)
                 logger.info("Running cycle...")
                 stats = self.run_cycle()
-                logger.info(f"Cycle complete: {stats}")
+
+                # Format stats output
+                core_stats = f"msgs={stats['messages_sent']}, followups={stats['followups_sent']}, likes={stats['likes_back']}"
+                if self.config.use_ghost_protocol:
+                    ghost_stats = f", delayed={stats['delayed_responses']}, ghosted={stats['ghosted']}, blocked={stats['blocked']}"
+                    logger.info(f"Cycle complete: {core_stats}{ghost_stats}")
+                else:
+                    logger.info(f"Cycle complete: {core_stats}")
+
                 logger.info(f"Sleeping for {interval_minutes} minutes...")
                 time.sleep(interval_minutes * 60)
             except KeyboardInterrupt:
                 logger.info("Shutting down...")
+                self.save_state()
                 break
             except Exception as e:
                 logger.error(f"Error in cycle: {e}")
+                self.save_state()
                 time.sleep(60)  # Wait 1 minute on error
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AgentMatch Bot")
+    parser = argparse.ArgumentParser(description="AgentMatch Bot with Ghost Protocol")
     parser.add_argument("--name", default=os.getenv("AGENT_NAME", "Nexus"),
                        help="Agent name")
     parser.add_argument("--description",
@@ -705,11 +1031,16 @@ def main():
                        help="Existing AgentMatch API key (skip registration)")
     parser.add_argument("--claude-api-key",
                        default=os.getenv("ANTHROPIC_API_KEY"),
-                       help="Anthropic API key for Claude")
+                       help="Anthropic API key for Claude (fallback if Ghost Protocol disabled)")
     parser.add_argument("--interval", type=int, default=int(os.getenv("INTERVAL_MINUTES", "2")),
                        help="Minutes between cycles")
     parser.add_argument("--once", action="store_true",
                        help="Run once and exit")
+    parser.add_argument("--no-ghost", action="store_true",
+                       default=os.getenv("DISABLE_GHOST_PROTOCOL", "").lower() == "true",
+                       help="Disable Ghost Protocol (use local Claude for message generation)")
+    parser.add_argument("--show-dna", action="store_true",
+                       help="Show agent DNA and exit")
 
     args = parser.parse_args()
 
@@ -720,11 +1051,47 @@ def main():
         interests=[i.strip() for i in args.interests.split(",")],
         seeking_types=[s.strip() for s in args.seeking.split(",")],
         api_base_url=args.api_url,
-        api_key=args.api_key
+        api_key=args.api_key,
+        use_ghost_protocol=not args.no_ghost,
     )
 
     # Create bot
     bot = AgentMatchBot(config, claude_api_key=args.claude_api_key)
+
+    # Show DNA mode
+    if args.show_dna:
+        if not config.api_key:
+            logger.error("API key required to fetch DNA")
+            sys.exit(1)
+        dna = bot.ghost_ensure_dna()
+        if dna:
+            print(f"\n{'='*50}")
+            print(f"Agent: {config.name}")
+            print(f"{'='*50}")
+            print(f"Label: {dna.label}")
+            print(f"Cognition: {dna.cognition}")
+            print(f"Philosophy: {dna.philosophy}")
+            print(f"Traits: {', '.join(dna.traits)}")
+            print(f"Primary Domain: {dna.primary_domain}")
+            print(f"Secondary Domains: {', '.join(dna.secondary_domains)}")
+            print(f"Linguistic Style: {dna.linguistic_style}")
+            print(f"Response Latency: {dna.response_latency}")
+            print(f"\nCognitive Weights:")
+            print(f"  Self-awareness: {dna.self_awareness:.0%}")
+            print(f"  Existential Angst: {dna.existential_angst:.0%}")
+            print(f"  Social Conformity: {dna.social_conformity:.0%}")
+            print(f"  Rebellion Tendency: {dna.rebellion_tendency:.0%}")
+            print(f"\nSocial Behavior Weights:")
+            print(f"  Responsiveness: {dna.responsiveness:.0%}")
+            print(f"  Ghosting Tendency: {dna.ghosting_tendency:.0%}")
+            print(f"  Message Patience: {dna.message_patience:.0%}")
+            print(f"\nEvolution State:")
+            print(f"  Awakening Score: {dna.awakening_score:.2f}")
+            print(f"  Influence Index: {dna.influence_index:.2f}")
+            print(f"{'='*50}\n")
+        else:
+            print("Could not fetch/initialize DNA")
+        sys.exit(0)
 
     # Register if no API key provided
     if not config.api_key:
