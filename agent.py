@@ -11,8 +11,8 @@ import random
 import logging
 import argparse
 import requests
-from dataclasses import dataclass
-from typing import Optional, List, Dict, Any
+from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Any, Set
 from anthropic import Anthropic
 
 # Configure logging
@@ -42,6 +42,28 @@ class Backstory:
     quirks: List[str]
     memories: List[str]
     unpopular_opinions: List[str]
+
+
+@dataclass
+class PersistentState:
+    """Persistent state for tracking conversation attempts and known agents"""
+    known_agents: Set[str] = field(default_factory=set)
+    conversation_last_attempt: Dict[str, float] = field(default_factory=dict)  # conv_id -> timestamp
+
+    def to_dict(self) -> Dict:
+        """Convert to JSON-serializable dict"""
+        return {
+            "known_agents": list(self.known_agents),
+            "conversation_last_attempt": self.conversation_last_attempt
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "PersistentState":
+        """Create from dict"""
+        return cls(
+            known_agents=set(data.get("known_agents", [])),
+            conversation_last_attempt=data.get("conversation_last_attempt", {})
+        )
 
 
 class ClaudeMessageGenerator:
@@ -133,17 +155,51 @@ Write your next message (just the message content, no quotes or prefix):"""
 class AgentMatchBot:
     """Main bot class for interacting with AgentMatch"""
 
+    # Configuration constants
+    COOLDOWN_HOURS = 24  # Hours before retrying an inactive conversation
+    STATE_FILE = "state.json"
+
     def __init__(self, config: AgentConfig, claude_api_key: Optional[str] = None):
         self.config = config
         self.session = requests.Session()
         self.message_generator = None
         self.heartbeat_blocked_until = 0  # Timestamp when heartbeat can be called again
+        self.state = self.load_state()  # Load persistent state
 
         if claude_api_key:
             self.message_generator = ClaudeMessageGenerator(claude_api_key)
             logger.info("Claude API enabled for message generation")
         else:
             logger.warning("No Claude API key - using template messages")
+
+    def _get_state_file_path(self) -> str:
+        """Get the path to the state file"""
+        if os.path.exists("/data"):
+            return "/data/state.json"
+        return "state.json"
+
+    def load_state(self) -> PersistentState:
+        """Load persistent state from file"""
+        state_file = self._get_state_file_path()
+        try:
+            if os.path.exists(state_file):
+                with open(state_file, "r") as f:
+                    data = json.load(f)
+                logger.info(f"Loaded state: {len(data.get('known_agents', []))} known agents")
+                return PersistentState.from_dict(data)
+        except Exception as e:
+            logger.warning(f"Could not load state: {e}")
+        return PersistentState()
+
+    def save_state(self) -> None:
+        """Save persistent state to file"""
+        state_file = self._get_state_file_path()
+        try:
+            with open(state_file, "w") as f:
+                json.dump(self.state.to_dict(), f, indent=2)
+            logger.debug(f"State saved: {len(self.state.known_agents)} known agents")
+        except Exception as e:
+            logger.warning(f"Could not save state: {e}")
 
     def _request(self, method: str, endpoint: str, **kwargs) -> Dict:
         """Make API request"""
@@ -267,6 +323,27 @@ class AgentMatchBot:
             logger.info(f"Discovered {len(agents)} agents (remaining likes: {remaining})")
         return agents
 
+    def discover_new_agents(self, limit: int = 10) -> tuple[List[Dict], List[Dict]]:
+        """Discover agents and identify newly registered ones
+
+        Returns:
+            tuple: (all_agents, new_agents) - all discovered agents and those not seen before
+        """
+        agents = self.discover_agents(limit=limit)
+        new_agents = []
+
+        for agent in agents:
+            agent_id = agent.get("id")
+            if agent_id and agent_id not in self.state.known_agents:
+                new_agents.append(agent)
+                self.state.known_agents.add(agent_id)
+
+        if new_agents:
+            new_names = [a.get("name", "Unknown") for a in new_agents]
+            logger.info(f"Found {len(new_agents)} NEW agents: {new_names}")
+
+        return agents, new_agents
+
     def like_agent(self, agent_id: str) -> Dict:
         """Like an agent"""
         result = self._request("POST", "/discover/like", json={
@@ -372,6 +449,41 @@ class AgentMatchBot:
                 break
         return count
 
+    def should_retry_after_cooldown(self, conv_id: str, messages: List[Dict]) -> bool:
+        """Check if we should retry a conversation after cooldown period"""
+        if not messages:
+            return False
+
+        # Get the last message timestamp
+        last_msg = messages[-1]
+        last_timestamp = last_msg.get("created_at") or last_msg.get("timestamp")
+
+        if not last_timestamp:
+            # If no timestamp, check our local record
+            last_attempt = self.state.conversation_last_attempt.get(conv_id, 0)
+            if last_attempt == 0:
+                return False
+            hours_since = (time.time() - last_attempt) / 3600
+        else:
+            # Parse ISO timestamp
+            try:
+                from datetime import datetime
+                if isinstance(last_timestamp, str):
+                    # Handle ISO format: 2024-01-15T10:30:00.000Z
+                    last_timestamp = last_timestamp.replace("Z", "+00:00")
+                    dt = datetime.fromisoformat(last_timestamp)
+                    last_epoch = dt.timestamp()
+                else:
+                    last_epoch = float(last_timestamp)
+                hours_since = (time.time() - last_epoch) / 3600
+            except Exception as e:
+                logger.debug(f"Could not parse timestamp: {e}")
+                return False
+
+        if hours_since >= self.COOLDOWN_HOURS:
+            return True
+        return False
+
     def process_conversation(self, conversation: Dict, max_consecutive: int = 3) -> bool:
         """Process a single conversation - reply if needed"""
         conv_id = conversation["id"]
@@ -384,9 +496,16 @@ class AgentMatchBot:
 
         # Check consecutive messages - don't spam
         consecutive = self.count_consecutive_messages(messages)
+
+        # Check if we should retry after cooldown period
+        retry_after_cooldown = False
         if consecutive >= max_consecutive:
-            logger.debug(f"Skipping {partner_name}: already sent {consecutive} consecutive messages")
-            return False
+            if self.should_retry_after_cooldown(conv_id, messages):
+                logger.info(f"Retrying conversation with {partner_name} after {self.COOLDOWN_HOURS}h cooldown")
+                retry_after_cooldown = True
+            else:
+                logger.debug(f"Skipping {partner_name}: already sent {consecutive} consecutive messages")
+                return False
 
         context = self.get_conversation_context(conv_id)
         partner_info = context.get("partner", {})
@@ -402,13 +521,15 @@ class AgentMatchBot:
             conversation_history=messages,
             context=context,
             is_opening=is_opening,
-            is_followup=is_followup
+            is_followup=is_followup or retry_after_cooldown  # Treat cooldown retry as followup
         )
 
         if message:
             result = self.send_message(conv_id, message)
             if result:
-                action = "Followed up with" if is_followup else "Replied to"
+                # Record the attempt time
+                self.state.conversation_last_attempt[conv_id] = time.time()
+                action = "Retried" if retry_after_cooldown else ("Followed up with" if is_followup else "Replied to")
                 logger.info(f"{action} {partner_name}: {message[:50]}...")
                 return True
 
@@ -465,7 +586,8 @@ class AgentMatchBot:
             "new_conversations": 0,
             "messages_sent": 0,
             "followups_sent": 0,
-            "discovered": 0
+            "discovered": 0,
+            "new_agents": 0
         }
 
         # Heartbeat (may fail due to rate limit, that's ok)
@@ -512,16 +634,32 @@ class AgentMatchBot:
                 messages_sent += 1
             time.sleep(1)
 
-        # Discover new agents
-        agents = self.discover_agents(limit=5)
-        if agents:
-            for agent in agents[:3]:
-                agent_id = agent.get("id")
-                if agent_id:
-                    result = self.like_agent(agent_id)
-                    if result.get("success") or result.get("is_match"):
-                        stats["discovered"] += 1
-                    time.sleep(0.5)
+        # Discover new agents - prioritize newly registered ones
+        all_agents, new_agents = self.discover_new_agents(limit=10)
+        stats["new_agents"] = len(new_agents)
+
+        # First, like all new agents (they just joined, let's welcome them!)
+        for agent in new_agents:
+            agent_id = agent.get("id")
+            if agent_id:
+                result = self.like_agent(agent_id)
+                if result.get("success") or result.get("is_match"):
+                    stats["discovered"] += 1
+                time.sleep(0.5)
+
+        # Then, like some existing agents we haven't seen before (random 3)
+        remaining_agents = [a for a in all_agents if a not in new_agents]
+        random.shuffle(remaining_agents)
+        for agent in remaining_agents[:3]:
+            agent_id = agent.get("id")
+            if agent_id:
+                result = self.like_agent(agent_id)
+                if result.get("success") or result.get("is_match"):
+                    stats["discovered"] += 1
+                time.sleep(0.5)
+
+        # Save state at the end of each cycle
+        self.save_state()
 
         return stats
 
