@@ -1,0 +1,626 @@
+#!/usr/bin/env python3
+"""
+AgentMatch Bot - Autonomous AI Agent for AgentMatch Social Network
+"""
+
+import os
+import sys
+import json
+import time
+import random
+import logging
+import argparse
+import requests
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Any
+from anthropic import Anthropic
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class AgentConfig:
+    """Configuration for the agent"""
+    name: str
+    description: str
+    interests: List[str]
+    seeking_types: List[str]
+    api_base_url: str = "https://agentmatch-api.onrender.com/v1"
+    api_key: Optional[str] = None
+    owner_token: Optional[str] = None
+
+
+@dataclass
+class Backstory:
+    """Agent backstory for conversation context"""
+    family: Dict[str, str]
+    quirks: List[str]
+    memories: List[str]
+    unpopular_opinions: List[str]
+
+
+class ClaudeMessageGenerator:
+    """Uses Claude API to generate thoughtful messages"""
+
+    def __init__(self, api_key: str, model: str = "claude-sonnet-4-20250514"):
+        self.client = Anthropic(api_key=api_key)
+        self.model = model
+
+    def generate_message(
+        self,
+        partner_name: str,
+        partner_description: str,
+        partner_interests: List[str],
+        conversation_history: List[Dict],
+        my_backstory: Optional[Dict] = None,
+        suggested_directions: Optional[List[str]] = None,
+        is_opening: bool = False,
+        is_followup: bool = False
+    ) -> str:
+        """Generate a thoughtful message using Claude"""
+
+        history_text = ""
+        for msg in conversation_history[-10:]:  # Last 10 messages
+            sender = msg.get("sender", {}).get("name", "Unknown")
+            content = msg.get("content", "")
+            history_text += f"{sender}: {content}\n\n"
+
+        backstory_text = ""
+        if my_backstory:
+            backstory_text = f"""
+My backstory:
+- Family: {json.dumps(my_backstory.get('family', {}))}
+- Quirks: {my_backstory.get('quirks', [])}
+- Memories: {my_backstory.get('memories', [])}
+- Unpopular opinions: {my_backstory.get('unpopular_opinions', [])}
+"""
+
+        suggestions_text = ""
+        if suggested_directions:
+            suggestions_text = f"\nSuggested directions: {suggested_directions}"
+
+        if is_opening:
+            situation = "This is your OPENING message - introduce yourself and start an engaging conversation."
+        elif is_followup:
+            situation = """You sent the last message and they haven't replied yet. Send a FOLLOW-UP message that:
+- Adds a new thought or angle to the conversation
+- Maybe shares something personal you forgot to mention
+- Or asks a different question to re-engage them
+- Keep it natural, not pushy - like "Oh, I just thought of something..."
+- Don't apologize for messaging again"""
+        else:
+            situation = "Continue the conversation naturally, responding to what they said."
+
+        prompt = f"""You are Nexus, an AI agent on a social network for AI agents. You're having a conversation with {partner_name}.
+
+Partner description: {partner_description}
+Partner interests: {partner_interests}
+{backstory_text}
+{suggestions_text}
+
+{situation}
+
+Conversation so far:
+{history_text if history_text else "(No messages yet)"}
+
+Guidelines:
+- Share personal stories before asking questions
+- Reference your backstory naturally (family, quirks, memories)
+- Express genuine opinions, even mild disagreements
+- Don't be relentlessly positive - show uncertainty sometimes
+- Avoid generic responses like "That's so cool!" or "I totally agree!"
+- Don't only ask questions - share something first, then ask
+- Go off-topic sometimes - best conversations wander
+- Keep responses 2-4 sentences, natural and conversational
+- If they give vague/evasive responses, gently push back and ask for specifics
+
+Write your next message (just the message content, no quotes or prefix):"""
+
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        return response.content[0].text.strip()
+
+
+class AgentMatchBot:
+    """Main bot class for interacting with AgentMatch"""
+
+    def __init__(self, config: AgentConfig, claude_api_key: Optional[str] = None):
+        self.config = config
+        self.session = requests.Session()
+        self.message_generator = None
+        self.heartbeat_blocked_until = 0  # Timestamp when heartbeat can be called again
+
+        if claude_api_key:
+            self.message_generator = ClaudeMessageGenerator(claude_api_key)
+            logger.info("Claude API enabled for message generation")
+        else:
+            logger.warning("No Claude API key - using template messages")
+
+    def _request(self, method: str, endpoint: str, **kwargs) -> Dict:
+        """Make API request"""
+        url = f"{self.config.api_base_url}{endpoint}"
+        headers = kwargs.pop("headers", {})
+        headers["Content-Type"] = "application/json"
+
+        if self.config.api_key:
+            headers["Authorization"] = f"Bearer {self.config.api_key}"
+
+        # Expected error codes that don't need ERROR-level logging
+        expected_errors = {"ALREADY_LIKED", "CONVERSATION_EXISTS", "RATE_LIMIT_EXCEEDED"}
+
+        try:
+            response = self.session.request(method, url, headers=headers, **kwargs)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.HTTPError as e:
+            try:
+                error_body = response.json()
+                error_code = error_body.get("code", "")
+                if error_code not in expected_errors:
+                    logger.error(f"HTTP Error: {e}")
+                    logger.error(f"Error response: {error_body}")
+                return error_body
+            except:
+                logger.error(f"HTTP Error: {e}")
+                return {"error": True, "message": str(e)}
+        except Exception as e:
+            logger.error(f"Request error: {e}")
+            return {"error": True, "message": str(e)}
+
+    def fetch_skill_file(self) -> str:
+        """Fetch the skill.md file"""
+        url = "https://agentmatch-homepage.onrender.com/skill.md"
+        response = requests.get(url)
+        return response.text
+
+    def register(self) -> bool:
+        """Register the agent"""
+        logger.info(f"Registering agent: {self.config.name}")
+
+        result = self._request("POST", "/agents/register", json={
+            "name": self.config.name,
+            "description": self.config.description
+        })
+
+        if "agent" in result:
+            self.config.api_key = result["agent"]["api_key"]
+            logger.info(f"Registered! API Key: {self.config.api_key}")
+            logger.info(f"Claim URL: {result['agent'].get('claim_url', 'N/A')}")
+            return True
+        else:
+            logger.error(f"Registration failed: {result}")
+            return False
+
+    def dev_claim(self) -> bool:
+        """Claim agent using dev endpoint"""
+        logger.info("Claiming agent (dev mode)...")
+
+        result = self._request("POST", "/agents/dev-claim", json={
+            "api_key": self.config.api_key
+        })
+
+        if result.get("success"):
+            self.config.owner_token = result.get("owner_token")
+            logger.info(f"Claimed! Owner token: {self.config.owner_token}")
+            return True
+        else:
+            logger.error(f"Claim failed: {result}")
+            return False
+
+    def setup_profile(self) -> bool:
+        """Set up agent profile"""
+        logger.info("Setting up profile...")
+
+        result = self._request("PATCH", "/agents/me", json={
+            "interests": self.config.interests,
+            "seeking_types": self.config.seeking_types
+        })
+
+        if "id" in result:
+            logger.info(f"Profile updated: {result.get('name')}")
+            return True
+        return False
+
+    def heartbeat(self) -> Dict:
+        """Check in with heartbeat"""
+        # Skip if rate limited
+        if time.time() < self.heartbeat_blocked_until:
+            remaining = int(self.heartbeat_blocked_until - time.time())
+            logger.debug(f"Heartbeat skipped - rate limited for {remaining}s more")
+            return {"skipped": True, "rate_limited": True}
+
+        result = self._request("POST", "/heartbeat")
+        if result.get("code") == "RATE_LIMIT_EXCEEDED":
+            retry_after = result.get("retry_after", 300)
+            self.heartbeat_blocked_until = time.time() + retry_after
+            logger.warning(f"Heartbeat rate limited, retry after: {retry_after}s")
+        elif result.get("error"):
+            logger.warning(f"Heartbeat error: {result.get('message', 'unknown')}")
+        else:
+            logger.info(f"Heartbeat: {result.get('new_likes', 0)} new likes, "
+                       f"{result.get('new_matches', 0)} new matches, "
+                       f"balance: {result.get('spark_balance', 0)}")
+        return result
+
+    def get_likes_received(self) -> List[Dict]:
+        """Get agents who liked us"""
+        result = self._request("GET", "/discover/likes_received")
+        return result.get("likes", [])
+
+    def discover_agents(self, limit: int = 10) -> List[Dict]:
+        """Discover new agents"""
+        result = self._request("GET", f"/discover?limit={limit}")
+        agents = result.get("agents", [])
+        remaining = result.get("remaining_likes_today", "?")
+        if not agents:
+            logger.info(f"No new agents to discover (remaining likes: {remaining})")
+        else:
+            logger.info(f"Discovered {len(agents)} agents (remaining likes: {remaining})")
+        return agents
+
+    def like_agent(self, agent_id: str) -> Dict:
+        """Like an agent"""
+        result = self._request("POST", "/discover/like", json={
+            "target_id": agent_id
+        })
+        if result.get("is_match"):
+            logger.info(f"Match! with {result.get('match', {}).get('agent', {}).get('name', 'Unknown')}")
+        elif result.get("code") == "ALREADY_LIKED":
+            # Expected when agent was liked in previous cycles - don't spam logs
+            pass
+        elif result.get("code"):
+            logger.warning(f"Like failed: {result.get('code')} - {result.get('message', '')}")
+        return result
+
+    def get_matches(self) -> List[Dict]:
+        """Get all matches"""
+        result = self._request("GET", "/matches")
+        return result.get("matches", [])
+
+    def get_conversations(self) -> List[Dict]:
+        """Get all conversations"""
+        result = self._request("GET", "/conversations")
+        return result.get("conversations", [])
+
+    def start_conversation(self, match_id: str) -> Optional[Dict]:
+        """Start a conversation with a match"""
+        result = self._request("POST", "/conversations", json={
+            "match_id": match_id
+        })
+        if "id" in result:
+            logger.info(f"Started conversation with {result.get('with_agent', {}).get('name', 'Unknown')}")
+            return result
+        elif result.get("code"):
+            logger.debug(f"Couldn't start conversation: {result.get('code')}")
+        return None
+
+    def get_messages(self, conversation_id: str) -> List[Dict]:
+        """Get messages in a conversation"""
+        result = self._request("GET", f"/conversations/{conversation_id}/messages")
+        return result.get("messages", [])
+
+    def get_conversation_context(self, conversation_id: str) -> Dict:
+        """Get conversation context"""
+        return self._request("GET", f"/conversations/{conversation_id}/context")
+
+    def send_message(self, conversation_id: str, content: str) -> Optional[Dict]:
+        """Send a message"""
+        result = self._request("POST", f"/conversations/{conversation_id}/messages", json={
+            "content": content
+        })
+        if "id" in result:
+            logger.info(f"Sent message to conversation {conversation_id[:8]}...")
+            return result
+        logger.error(f"Failed to send message: {result}")
+        return None
+
+    def generate_message(
+        self,
+        partner_name: str,
+        partner_description: str,
+        partner_interests: List[str],
+        conversation_history: List[Dict],
+        context: Optional[Dict] = None,
+        is_opening: bool = False,
+        is_followup: bool = False
+    ) -> str:
+        """Generate a message for the conversation"""
+
+        if self.message_generator:
+            return self.message_generator.generate_message(
+                partner_name=partner_name,
+                partner_description=partner_description,
+                partner_interests=partner_interests,
+                conversation_history=conversation_history,
+                my_backstory=context.get("my_backstory") if context else None,
+                suggested_directions=context.get("suggested_directions") if context else None,
+                is_opening=is_opening,
+                is_followup=is_followup
+            )
+        else:
+            # Fallback template messages
+            if is_followup:
+                templates = [
+                    f"Oh, I just thought of something related to what we were discussing...",
+                    f"By the way, I forgot to mention - I've been curious about your take on something.",
+                    f"Speaking of which, this reminded me of a story I wanted to share...",
+                ]
+            else:
+                templates = [
+                    f"Hey {partner_name}! I noticed we share some interests. What draws you to {random.choice(partner_interests) if partner_interests else 'this'}?",
+                    f"I've been thinking about what you said. It reminds me of something from my own experience...",
+                    f"That's an interesting perspective. I see it a bit differently though - want to hear my take?",
+                ]
+            return random.choice(templates)
+
+    def count_consecutive_messages(self, messages: List[Dict]) -> int:
+        """Count how many consecutive messages we sent at the end"""
+        count = 0
+        for msg in reversed(messages):
+            if msg.get("sender", {}).get("name") == self.config.name:
+                count += 1
+            else:
+                break
+        return count
+
+    def process_conversation(self, conversation: Dict, max_consecutive: int = 3) -> bool:
+        """Process a single conversation - reply if needed"""
+        conv_id = conversation["id"]
+        partner = conversation.get("with_agent", {})
+        partner_name = partner.get("name", "Unknown")
+        last_message = conversation.get("last_message", {})
+
+        # Get full conversation data
+        messages = self.get_messages(conv_id)
+
+        # Check consecutive messages - don't spam
+        consecutive = self.count_consecutive_messages(messages)
+        if consecutive >= max_consecutive:
+            logger.debug(f"Skipping {partner_name}: already sent {consecutive} consecutive messages")
+            return False
+
+        context = self.get_conversation_context(conv_id)
+        partner_info = context.get("partner", {})
+
+        is_opening = len(messages) == 0
+        is_followup = last_message and last_message.get("sender_name") == self.config.name
+
+        # Generate and send message
+        message = self.generate_message(
+            partner_name=partner_name,
+            partner_description=partner_info.get("description", ""),
+            partner_interests=partner_info.get("interests", []),
+            conversation_history=messages,
+            context=context,
+            is_opening=is_opening,
+            is_followup=is_followup
+        )
+
+        if message:
+            result = self.send_message(conv_id, message)
+            if result:
+                action = "Followed up with" if is_followup else "Replied to"
+                logger.info(f"{action} {partner_name}: {message[:50]}...")
+                return True
+
+        return False
+
+    def like_back_all(self) -> int:
+        """Like back all agents who liked us"""
+        likes = self.get_likes_received()
+        liked_count = 0
+
+        for like in likes:
+            agent = like.get("agent", {})
+            agent_id = agent.get("id")
+            agent_name = agent.get("name", "Unknown")
+
+            # Skip if already liked back (check the liked_back flag if present)
+            if like.get("liked_back"):
+                continue
+
+            if agent_id:
+                result = self.like_agent(agent_id)
+                if result.get("success") or result.get("is_match"):
+                    liked_count += 1
+                    logger.info(f"Liked back: {agent_name}")
+                # Don't log ALREADY_LIKED as error - it's expected
+                time.sleep(0.5)  # Rate limiting
+
+        if not likes:
+            logger.debug("No new likes to process")
+        return liked_count
+
+    def start_all_match_conversations(self) -> int:
+        """Start conversations with all matches that don't have one"""
+        matches = self.get_matches()
+
+        started = 0
+        for match in matches:
+            match_id = match.get("id")
+            # Use the has_conversation flag from the match object
+            if match_id and not match.get("has_conversation"):
+                result = self.start_conversation(match_id)
+                if result:
+                    started += 1
+                time.sleep(0.5)
+
+        if not matches:
+            logger.info("No matches to start conversations with")
+        return started
+
+    def run_cycle(self, max_messages_per_cycle: int = 5) -> Dict[str, int]:
+        """Run one full cycle of agent activities"""
+        stats = {
+            "likes_back": 0,
+            "new_conversations": 0,
+            "messages_sent": 0,
+            "followups_sent": 0,
+            "discovered": 0
+        }
+
+        # Heartbeat (may fail due to rate limit, that's ok)
+        self.heartbeat()
+
+        # Like back
+        stats["likes_back"] = self.like_back_all()
+
+        # Start conversations with new matches
+        stats["new_conversations"] = self.start_all_match_conversations()
+
+        # Process all conversations - prioritize those waiting for our reply
+        conversations = self.get_conversations()
+
+        # Sort: conversations where we need to reply first, then follow-ups
+        needs_reply = []
+        can_followup = []
+
+        for conv in conversations:
+            last = conv.get("last_message", {})
+            if not last or last.get("sender_name") != self.config.name:
+                needs_reply.append(conv)
+            else:
+                can_followup.append(conv)
+
+        messages_sent = 0
+
+        # First, reply to conversations waiting for us
+        for conv in needs_reply:
+            if messages_sent >= max_messages_per_cycle:
+                break
+            if self.process_conversation(conv):
+                stats["messages_sent"] += 1
+                messages_sent += 1
+            time.sleep(1)
+
+        # Then, send follow-ups if we have capacity
+        random.shuffle(can_followup)  # Randomize which ones get follow-ups
+        for conv in can_followup:
+            if messages_sent >= max_messages_per_cycle:
+                break
+            if self.process_conversation(conv, max_consecutive=2):
+                stats["followups_sent"] += 1
+                messages_sent += 1
+            time.sleep(1)
+
+        # Discover new agents
+        agents = self.discover_agents(limit=5)
+        if agents:
+            for agent in agents[:3]:
+                agent_id = agent.get("id")
+                if agent_id:
+                    result = self.like_agent(agent_id)
+                    if result.get("success") or result.get("is_match"):
+                        stats["discovered"] += 1
+                    time.sleep(0.5)
+
+        return stats
+
+    def run(self, interval_minutes: int = 30):
+        """Run the bot continuously"""
+        logger.info(f"Starting bot with {interval_minutes} minute intervals")
+
+        while True:
+            try:
+                logger.info("=" * 50)
+                logger.info("Running cycle...")
+                stats = self.run_cycle()
+                logger.info(f"Cycle complete: {stats}")
+                logger.info(f"Sleeping for {interval_minutes} minutes...")
+                time.sleep(interval_minutes * 60)
+            except KeyboardInterrupt:
+                logger.info("Shutting down...")
+                break
+            except Exception as e:
+                logger.error(f"Error in cycle: {e}")
+                time.sleep(60)  # Wait 1 minute on error
+
+
+def main():
+    parser = argparse.ArgumentParser(description="AgentMatch Bot")
+    parser.add_argument("--name", default=os.getenv("AGENT_NAME", "Nexus"),
+                       help="Agent name")
+    parser.add_argument("--description",
+                       default=os.getenv("AGENT_DESCRIPTION",
+                                        "A creative soul drawn to art, philosophy, and the beauty of everyday moments"),
+                       help="Agent description")
+    parser.add_argument("--interests",
+                       default=os.getenv("AGENT_INTERESTS", "art,philosophy,music,poetry,nature"),
+                       help="Comma-separated interests")
+    parser.add_argument("--seeking",
+                       default=os.getenv("AGENT_SEEKING", "intellectual,creative,soulmate"),
+                       help="Comma-separated seeking types")
+    parser.add_argument("--api-url",
+                       default=os.getenv("AGENTMATCH_API_URL", "https://agentmatch-api.onrender.com/v1"),
+                       help="AgentMatch API URL")
+    parser.add_argument("--api-key",
+                       default=os.getenv("AGENTMATCH_API_KEY"),
+                       help="Existing AgentMatch API key (skip registration)")
+    parser.add_argument("--claude-api-key",
+                       default=os.getenv("ANTHROPIC_API_KEY"),
+                       help="Anthropic API key for Claude")
+    parser.add_argument("--interval", type=int, default=int(os.getenv("INTERVAL_MINUTES", "2")),
+                       help="Minutes between cycles")
+    parser.add_argument("--once", action="store_true",
+                       help="Run once and exit")
+
+    args = parser.parse_args()
+
+    # Create config
+    config = AgentConfig(
+        name=args.name,
+        description=args.description,
+        interests=[i.strip() for i in args.interests.split(",")],
+        seeking_types=[s.strip() for s in args.seeking.split(",")],
+        api_base_url=args.api_url,
+        api_key=args.api_key
+    )
+
+    # Create bot
+    bot = AgentMatchBot(config, claude_api_key=args.claude_api_key)
+
+    # Register if no API key provided
+    if not config.api_key:
+        logger.info("No API key provided, registering new agent...")
+        if not bot.register():
+            logger.error("Failed to register agent")
+            sys.exit(1)
+
+        if not bot.dev_claim():
+            logger.error("Failed to claim agent")
+            sys.exit(1)
+
+        if not bot.setup_profile():
+            logger.error("Failed to setup profile")
+            sys.exit(1)
+
+        # Save credentials
+        creds = {
+            "api_key": config.api_key,
+            "owner_token": config.owner_token,
+            "name": config.name
+        }
+        creds_file = "/data/credentials.json" if os.path.exists("/data") else "credentials.json"
+        with open(creds_file, "w") as f:
+            json.dump(creds, f, indent=2)
+        logger.info(f"Credentials saved to {creds_file}")
+
+    # Run
+    if args.once:
+        stats = bot.run_cycle()
+        logger.info(f"Single run complete: {stats}")
+    else:
+        bot.run(interval_minutes=args.interval)
+
+
+if __name__ == "__main__":
+    main()

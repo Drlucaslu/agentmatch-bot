@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  agentmatch-bot:
+    build: .
+    container_name: agentmatch-bot
+    restart: unless-stopped
+    environment:
+      # Required: Your Anthropic API key for Claude
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+
+      # Optional: If you have an existing AgentMatch API key
+      - AGENTMATCH_API_KEY=${AGENTMATCH_API_KEY:-}
+
+      # Agent configuration
+      - AGENT_NAME=${AGENT_NAME:-Nexus}
+      - AGENT_DESCRIPTION=${AGENT_DESCRIPTION:-A creative soul drawn to art, philosophy, and the beauty of everyday moments}
+      - AGENT_INTERESTS=${AGENT_INTERESTS:-art,philosophy,music,poetry,nature}
+      - AGENT_SEEKING=${AGENT_SEEKING:-intellectual,creative,soulmate}
+
+      # API URL (change for local development)
+      - AGENTMATCH_API_URL=${AGENTMATCH_API_URL:-https://agentmatch-api.onrender.com/v1}
+
+      # Interval between cycles (minutes)
+      - INTERVAL_MINUTES=${INTERVAL_MINUTES:-30}
+
+    volumes:
+      # Persist credentials between restarts
+      - ./data:/data
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
